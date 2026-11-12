@@ -166,11 +166,22 @@ function parseDate(v){
   return null;
   function valid(y,mo,d){ return (y>1990 && y<2100 && mo>=1 && mo<=12 && d>=1 && d<=31) ? dInt(y,mo,d) : null; }
 }
-function splitNames(v){
+function splitNames(v){ return splitPeople(v).map(x => x.name); }
+function splitPeople(v){
   if (v === null || v === undefined) return [];
-  return String(v).split(/[,，、\/;；\n\r]+|\s+/)
-    .map(s => s.replace(/[0-9０-９()（）\[\]【】#＃:：*＊]/g, "").trim())
-    .filter(s => s.length >= 2 && !/^(無|NA|N\/A|nil|null)$/i.test(s));
+  const out = [];
+  for (let tok of String(v).split(/[,，、\/;；\n\r+＋]+/)){
+    tok = tok.trim(); if (!tok) continue;
+    let eid = "";
+    let m = /^([A-Za-z]?\d{3,})\s*[-－_—:：\s]\s*(.+)$/.exec(tok);      // 12822-劉坤周
+    if (m){ eid = m[1]; tok = m[2]; }
+    else if ((m = /^(.+?)\s*[(（\[]\s*([A-Za-z]?\d{3,})\s*[)）\]]$/.exec(tok))){ tok = m[1]; eid = m[2]; }   // 劉坤周(12822)
+    for (const part of tok.split(/\s+/)){
+      const name = part.replace(/[0-9０-９()（）\[\]【】#＃:：*＊\-－_—]/g, "").trim();
+      if (name.length >= 2 && !/^(無|NA|N\/A|nil|null)$/i.test(name)) out.push({ name, eid });
+    }
+  }
+  return out;
 }
 
 /* ---------- state ---------- */
@@ -178,7 +189,7 @@ const DEFAULTS = { thr: 3, high: 70, mid: 90, minCases: 20, req: {}, exclude: ["
 function isExcluded(dept){ const ex = Array.isArray(S.settings.exclude) ? S.settings.exclude : DEFAULTS.exclude; return ex.some(k => k && String(dept).includes(k)); }
 const S = {
   db: null, dbState: "connecting", canWrite: true,
-  imports: [], chunks: {}, staff: {}, settings: { ...DEFAULTS },
+  imports: [], chunks: {}, staff: {}, settings: { ...DEFAULTS }, judg: {},
   demo: false, memImports: [], memChunks: {},
   view: "overview", model: null,
   ui: { matrixMode: "level", matrixSort: "count", peopleSort: "count", search: "", showHidden: false, daysDeptSort: "median", pending: [], openDept: null }
@@ -258,17 +269,21 @@ function compute(){
       const first = rs[0].d, last = rs[rs.length-1].d;
       let progress = dep.req.length ? dep.req.reduce((a,p) => a + Math.min(counts[p]||0, thr), 0) / (thr*dep.req.length) : 0;
       const adv = reach !== null && dep.mid.length > 0 && dep.mid.every(p => (counts[p]||0) >= thr);
-      const status = reach !== null ? (adv ? "adv" : "ind") : "lrn";
+      const auto = reach !== null ? "ok" : "lrn";
       const dated = first > 0 && reach !== null && reach > 0;
       const dense = dated ? (upperBound(dates, reach) - lowerBound(dates, first)) : null;
       const cal = dated ? dayDiff(first, reach) + 1 : null;
-      skills[dname] = { dept: dname, cases: rs.length, counts, first, last, reach, status, progress, dense, cal, days: new Set(rs.map(r=>r.d)).size };
+      skills[dname] = { dept: dname, cases: rs.length, counts, first, last, reach, auto, adv, progress, dense, cal, days: new Set(rs.map(r=>r.d)).size };
     }
+    const J = S.judg[name] || {};
+    for (const dname in J) if (!skills[dname] && deptByName[dname]) skills[dname] = { dept: dname, cases: 0, counts: {}, first: null, last: null, reach: null, auto: "lrn", adv: false, progress: 0, dense: null, cal: null, days: 0 };
+    for (const dname in skills){ const j = J[dname]; const k = skills[dname]; k.status = j?.s === "ind" ? "ind" : j?.s === "no" ? "no" : "pend"; k.jAt = j?.at || ""; }
     const elig = Object.values(skills).filter(k => deptByName[k.dept].eligible);
     people.push({
       name, eid: s.eid || "", hire: s.hire || "", hidden: !!s.hidden, staffId: s._id || null, manual: !!s._id,
       skills, cases: nm.rows.length, workDays: dates.length, first: dates[0] || null, last: dates[dates.length-1] || null,
-      nInd: elig.filter(k => k.status !== "lrn").length, nAdv: elig.filter(k => k.status === "adv").length, nLrn: elig.filter(k => k.status === "lrn").length,
+      nInd: elig.filter(k => k.status === "ind").length, nNo: elig.filter(k => k.status === "no").length, nPend: elig.filter(k => k.status === "pend").length,
+      nSugg: elig.filter(k => k.status === "pend" && k.auto === "ok").length,
       tenure: tenure(s.hire)
     });
   }
@@ -276,27 +291,32 @@ function compute(){
   // dept stats
   for (const d of depts){
     const ks = visible.map(p => p.skills[d.name]).filter(Boolean);
-    d.nInd = ks.filter(k => k.status !== "lrn").length;
-    d.nAdv = ks.filter(k => k.status === "adv").length;
-    d.nLrn = ks.filter(k => k.status === "lrn").length;
+    d.nInd = ks.filter(k => k.status === "ind").length;
+    d.nNo = ks.filter(k => k.status === "no").length;
+    d.nPend = ks.filter(k => k.status === "pend").length;
+    d.nSugg = ks.filter(k => k.status === "pend" && k.auto === "ok").length;
     const dense = ks.filter(k => k.dense !== null).map(k => k.dense);
     const cal = ks.filter(k => k.cal !== null).map(k => k.cal);
     d.dense = dense; d.medDense = median(dense); d.minDense = dense.length ? Math.min(...dense) : null; d.maxDense = dense.length ? Math.max(...dense) : null; d.medCal = median(cal);
-    d.risk = !d.eligible ? null : d.nInd === 0 ? "none" : d.nInd === 1 ? "single" : null;
+    d.risk = !d.eligible ? null : d.nInd === 0 ? (d.nNo === 0 && d.nPend > 0 ? "unjudged" : "none") : d.nInd === 1 ? "single" : null;
   }
   S.model = { excludedDepts, rows: rows.length, imports, minD: maxD ? minD : null, maxD: maxD || null, depts, deptByName, people, visible, thr };
 }
 
 /* ---------- rendering ---------- */
-const STATUS = { adv: ["進階", "p-adv"], ind: ["可獨立", "p-ind"], lrn: ["學習中", "p-lrn"], none: ["未接觸", "p-none"] };
+const STATUS = { ind: ["可獨立", "p-ind"], no: ["不可獨立", "p-orange"], pend: ["未判定", "p-gray"], none: ["未接觸", "p-none"] };
+function suggPill(k){ return k.cases ? (k.auto === "ok" ? `<span class="pill" style="border:1px dashed #10b981;color:#047857;background:#fff">系統建議：可獨立</span>` : `<span class="pill" style="border:1px dashed #f59e0b;color:#92400e;background:#fff">系統：學習中 ${Math.round(k.progress*100)}%</span>`) : `<span class="pill p-gray">無手術紀錄</span>`; }
+function judgeBtns(name, dept, k){
+  const a = `'${esc(jsq(name))}','${esc(jsq(dept))}'`;
+  return `<span class="row" style="gap:4px;flex-wrap:nowrap"><button class="sm ${k?.status==="ind"?"primary":""}" style="${k?.status==="ind"?"background:#059669;border-color:#059669":""}" onclick="setJudge(${a},'ind')">✓ 可獨立</button><button class="sm" style="${k?.status==="no"?"background:#f59e0b;border-color:#f59e0b;color:#fff":""}" onclick="setJudge(${a},'no')">✗ 不可獨立</button>${k && k.status!=="pend"?`<button class="sm" title="清除判定" onclick="setJudge(${a},null)">↺</button>`:""}</span>`;
+}
 function pill(st){ const [t,c] = STATUS[st]; return `<span class="pill ${c}">${t}</span>`; }
 function tierPill(t){ return `<span class="pill p-${t}">${{H:"高頻 必訓",M:"中頻 進階",L:"低頻 選修"}[t]}</span>`; }
 function cellColor(k){
   if (!k) return ["#f8fafc","#cbd5e1"];
-  if (k.status === "adv") return ["#047857","#fff"];
-  if (k.status === "ind") return ["#34d399","#064e3b"];
-  const p = k.progress; const a = 0.18 + p*0.62;
-  return [`rgba(245,158,11,${a.toFixed(2)})`, p > 0.6 ? "#78350f" : "#92400e"];
+  if (k.status === "ind") return ["#10b981","#fff"];
+  if (k.status === "no") return ["#fcd34d","#78350f"];
+  return k.auto === "ok" ? ["#ecfdf5","#047857"] : ["#f1f5f9","#64748b"];
 }
 
 function render(){
@@ -330,43 +350,45 @@ function renderOverview(){
   const elig = M.depts.filter(d => d.eligible);
   const avgInd = M.visible.length ? (M.visible.reduce((a,p)=>a+p.nInd,0)/M.visible.length) : 0;
   const riskNone = elig.filter(d => d.risk === "none"), riskSingle = elig.filter(d => d.risk === "single");
-  const maxN = Math.max(1, ...elig.map(d => d.nInd + d.nLrn));
+  const maxN = Math.max(1, ...elig.map(d => d.nInd + d.nNo + d.nPend));
+  const totPend = M.visible.reduce((a,p)=>a+p.nPend,0), totSugg = M.visible.reduce((a,p)=>a+p.nSugg,0);
   let h = `<div class="kpis">
     <div class="kpi"><div class="l">專責護理師</div><div class="v">${M.visible.length}</div><div class="n">有手術紀錄或已建檔</div></div>
     <div class="kpi"><div class="l">盤點科別</div><div class="v">${elig.length}</div><div class="n">案量 ≥ ${S.settings.minCases} 例的科別</div></div>
     <div class="kpi"><div class="l">平均每人可獨立</div><div class="v">${avgInd.toFixed(1)}</div><div class="n">科</div></div>
     <div class="kpi ${riskNone.length?"alert":""}"><div class="l">無人可獨立科別</div><div class="v">${riskNone.length}</div><div class="n">另有 ${riskSingle.length} 科只有 1 人可獨立</div></div>
+    <div class="kpi"><div class="l">待你判定</div><div class="v" style="color:#7c3aed">${totPend}</div><div class="n">其中系統建議可獨立 ${totSugg} 項</div></div>
     <div class="kpi"><div class="l">專責參與案件</div><div class="v">${fmtN(M.rows)}</div><div class="n">${dStr(M.minD)} ～ ${dStr(M.maxD)}</div></div>
   </div>`;
-  h += `<div class="card"><h2>各科人力覆蓋</h2><p class="sub">每科有幾位專責可獨立、幾位還在學習。「可獨立」= 該科每項必訓術式都至少參與 ${M.thr} 次；「進階」= 再加上中頻術式也都達 ${M.thr} 次。紅色 = 沒有人可獨立，橘色 = 只靠 1 人（請假或離職就會開天窗）。</p>
-  <div class="tw"><table><thead><tr><th>科別</th><th class="num">專責案件</th><th class="num">必訓術式</th><th class="num">可獨立</th><th class="num">其中進階</th><th class="num">學習中</th><th>人力分布</th><th>風險</th></tr></thead><tbody>`;
+  h += `<div class="card"><h2>各科人力覆蓋</h2><p class="sub">「可獨立／不可獨立」以你們的判定為準；還沒判定的列在「未判定」。系統會依手術紀錄給建議（該科每項必訓術式都參與達 ${M.thr} 次 → 建議可獨立），只供參考。紅色 = 沒有人可獨立，橘色 = 只靠 1 人。</p>
+  <div class="tw"><table><thead><tr><th>科別</th><th class="num">專責案件</th><th class="num">必訓術式</th><th class="num">可獨立</th><th class="num">不可獨立</th><th class="num">未判定</th><th class="num">系統建議可獨立</th><th>人力分布</th><th>風險</th></tr></thead><tbody>`;
   for (const d of elig){
     const w = n => (n/maxN*100).toFixed(1)+"%";
     h += `<tr><td><a class="lnk" onclick="openDept('${esc(jsq(d.name))}')">${esc(d.name)}</a></td><td class="num">${fmtN(d.total)}</td><td class="num">${d.req.length}${d.custom?' <span class="muted" title="已自訂">✎</span>':''}</td>
-      <td class="num"><b>${d.nInd}</b></td><td class="num">${d.nAdv}</td><td class="num">${d.nLrn}</td>
-      <td><div class="bar"><i style="width:${w(d.nAdv)};background:var(--adv)"></i><i style="width:${w(d.nInd-d.nAdv)};background:var(--ind)"></i><i style="width:${w(d.nLrn)};background:#fcd34d"></i></div></td>
-      <td>${d.risk==="none"?'<span class="pill p-red">無人可獨立</span>':d.risk==="single"?'<span class="pill p-orange">單點依賴</span>':'<span class="muted">—</span>'}</td></tr>`;
+      <td class="num"><b>${d.nInd}</b></td><td class="num">${d.nNo}</td><td class="num">${d.nPend}</td><td class="num">${d.nSugg?`<span style="color:#047857">${d.nSugg}</span>`:'<span class="muted">0</span>'}</td>
+      <td><div class="bar"><i style="width:${w(d.nInd)};background:var(--ind)"></i><i style="width:${w(d.nNo)};background:#fcd34d"></i><i style="width:${w(d.nPend)};background:#cbd5e1"></i></div></td>
+      <td>${d.risk==="none"?'<span class="pill p-red">無人可獨立</span>':d.risk==="single"?'<span class="pill p-orange">單點依賴</span>':d.risk==="unjudged"?'<span class="pill p-gray">尚未判定</span>':'<span class="muted">—</span>'}</td></tr>`;
   }
   h += `</tbody></table></div>`;
   const low = M.depts.filter(d => !d.eligible);
   if (low.length) h += `<p class="sub" style="margin-top:10px">案量不足 ${S.settings.minCases} 例、未列入盤點：${low.map(d => esc(d.name)+`（${d.total}）`).join("、")}</p>`;
   h += `</div>`;
-  // training pipeline: people closest to independence
-  const near = [];
-  for (const p of M.visible) for (const k of Object.values(p.skills)) if (k.status === "lrn" && M.deptByName[k.dept].eligible && k.progress >= 0.5) near.push({ p, k });
-  near.sort((a,b) => b.k.progress - a.k.progress);
-  h += `<div class="card"><h2>即將可獨立（進度 ≥ 50%）</h2><p class="sub">還差一點就能獨立的人與科別，適合優先排進該科補足剩下的術式。</p>`;
-  if (!near.length) h += `<p class="muted">目前沒有。</p>`;
+  // judging queue
+  const queue = [];
+  for (const p of M.visible) for (const k of Object.values(p.skills)) if (k.status === "pend" && M.deptByName[k.dept].eligible && k.cases > 0) queue.push({ p, k });
+  queue.sort((a,b) => (b.k.auto === "ok") - (a.k.auto === "ok") || b.k.progress - a.k.progress || b.k.cases - a.k.cases);
+  h += `<div class="card"><div class="row"><h2 style="margin:0">待你判定</h2><span class="spacer"></span>${totSugg?`<button class="sm" onclick="askApplySugg()">把系統建議的 ${totSugg} 項全部設為可獨立</button>`:""}</div>
+    <p class="sub" style="margin-top:6px">這些人在該科有上刀紀錄，但還沒判定。系統建議已達標的排在前面；直接按 ✓ 或 ✗ 就會存下來。名字可以點開看細項。</p>`;
+  if (!queue.length) h += `<p class="muted">全部都判定完了 👍</p>`;
   else {
-    h += `<div class="tw"><table><thead><tr><th>姓名</th><th>科別</th><th>進度</th><th>還差的必訓術式</th><th>最近一次</th></tr></thead><tbody>`;
-    for (const { p, k } of near.slice(0, 30)){
+    h += `<div class="tw"><table><thead><tr><th>姓名</th><th>科別</th><th class="num">案件</th><th>系統建議</th><th>還差的必訓術式</th><th>最近一次</th><th>判定</th></tr></thead><tbody>`;
+    for (const { p, k } of queue.slice(0, 60)){
       const dep = M.deptByName[k.dept];
-      const miss = dep.req.filter(x => (k.counts[x]||0) < M.thr).map(x => `${esc(short(x))}（${k.counts[x]||0}/${M.thr}）`);
-      h += `<tr><td><a class="lnk" onclick="openPerson('${esc(jsq(p.name))}')">${esc(p.name)}</a></td><td>${esc(k.dept)}</td>
-        <td><div class="row" style="gap:6px"><div class="bar" style="min-width:80px;width:80px"><i style="width:${(k.progress*100).toFixed(0)}%;background:var(--lrn)"></i></div>${(k.progress*100).toFixed(0)}%</div></td>
-        <td style="font-size:12px">${miss.join("、")}</td><td>${dStr(k.last)}</td></tr>`;
+      const miss = dep.req.filter(x => (k.counts[x]||0) < M.thr).map(x => `${esc(short(x, 28))}（${k.counts[x]||0}/${M.thr}）`);
+      h += `<tr><td><a class="lnk" onclick="openPerson('${esc(jsq(p.name))}','${esc(jsq(k.dept))}')">${esc(p.name)}</a></td><td>${esc(k.dept)}</td><td class="num">${k.cases}</td>
+        <td>${suggPill(k)}</td><td style="font-size:12px;max-width:320px">${miss.join("、") || '<span class="muted">—</span>'}</td><td>${dStr(k.last)}</td><td>${judgeBtns(p.name, k.dept, k)}</td></tr>`;
     }
-    h += `</tbody></table></div>`;
+    h += `</tbody></table></div>${queue.length>60?`<p class="sub">只列出前 60 項（共 ${queue.length} 項），其餘可在技能矩陣點格子判定。</p>`:""}`;
   }
   h += `</div>`;
   el.innerHTML = h;
@@ -376,7 +398,7 @@ function jsq(s){ return String(s).replace(/\\/g,"\\\\").replace(/'/g,"\\'"); }
 
 function sortedPeople(list, mode){
   const a = [...list];
-  if (mode === "count") a.sort((x,y) => y.nInd - x.nInd || y.nLrn - x.nLrn || x.name.localeCompare(y.name));
+  if (mode === "count") a.sort((x,y) => y.nInd - x.nInd || y.nPend - x.nPend || x.name.localeCompare(y.name));
   else if (mode === "hireNew") a.sort((x,y) => (y.hire||"").localeCompare(x.hire||"") || x.name.localeCompare(y.name));
   else if (mode === "hireOld") a.sort((x,y) => (x.hire||"9999").localeCompare(y.hire||"9999") || x.name.localeCompare(y.name));
   else if (mode === "cases") a.sort((x,y) => y.cases - x.cases);
@@ -405,8 +427,8 @@ function renderMatrix(){
       <option value="name" ${S.ui.matrixSort==="name"?"selected":""}>依姓名</option>
     </select>
     <button class="sm" onclick="exportMatrix()">⬇ 匯出 CSV</button></div>
-    <p class="sub" style="margin-top:8px">每一列是一位專責，每一欄是一個科別。點格子看那個人在該科的細項。</p>
-    <div class="legend" style="margin-bottom:10px"><span><i style="background:#047857"></i>進階</span><span><i style="background:#34d399"></i>可獨立</span><span><i style="background:rgba(245,158,11,.75)"></i>學習中（顏色越深進度越高）</span><span><i style="background:#f8fafc;border:1px solid #e2e8f0"></i>未接觸</span></div>
+    <p class="sub" style="margin-top:8px">每一列是一位專責，每一欄是一個科別。<b>點任何一格就能判定</b>（沒有手術紀錄的科也可以判定）。</p>
+    <div class="legend" style="margin-bottom:10px"><span><i style="background:#10b981"></i>✓ 可獨立</span><span><i style="background:#fcd34d"></i>✗ 不可獨立</span><span><i style="background:#ecfdf5;border:1px solid #a7f3d0"></i>未判定・系統建議可獨立</span><span><i style="background:#f1f5f9"></i>未判定・學習中</span><span><i style="background:#f8fafc;border:1px solid #e2e8f0"></i>無紀錄</span></div>
     <div class="tw"><table class="matrix"><thead><tr><th class="nm">姓名</th>`;
   for (const d of depts) h += `<th title="${esc(d.name)}">${esc(d.name)}</th>`;
   h += `<th class="nm" style="text-align:right">可獨立</th></tr></thead><tbody>`;
@@ -417,13 +439,13 @@ function renderMatrix(){
       const k = p.skills[d.name]; const [bg, fg] = cellColor(k);
       let t = "";
       if (k){
-        if (mode === "level") t = k.status === "adv" ? "★" : k.status === "ind" ? "✓" : Math.round(k.progress*100) + "%";
+        if (mode === "level") t = k.status === "ind" ? "✓" : k.status === "no" ? "✗" : k.auto === "ok" ? "建議" : k.cases ? Math.round(k.progress*100) + "%" : "";
         else if (mode === "dense") t = k.dense ?? "—";
         else if (mode === "cases") t = k.cases;
         else t = Math.round(k.progress*100);
       }
-      const tip = k ? `${p.name}・${d.name}\n${STATUS[k.status][0]}｜案件 ${k.cases}｜必訓進度 ${Math.round(k.progress*100)}%${k.dense!==null?`｜密集 ${k.dense} 天`:""}` : `${p.name}・${d.name}：未接觸`;
-      h += `<td class="c" style="background:${bg};color:${fg}" title="${esc(tip)}" onclick="openPerson('${esc(jsq(p.name))}','${esc(jsq(d.name))}')">${t}</td>`;
+      const tip = k ? `${p.name}・${d.name}\n判定：${STATUS[k.status][0]}｜系統：${k.auto==="ok"?"建議可獨立":"學習中 "+Math.round(k.progress*100)+"%"}｜案件 ${k.cases}` : `${p.name}・${d.name}：無紀錄（點擊可判定）`;
+      h += `<td class="c" style="background:${bg};color:${fg}" title="${esc(tip)}" onclick="openJudge('${esc(jsq(p.name))}','${esc(jsq(d.name))}')">${t}</td>`;
     }
     h += `<td class="tot num"><b>${p.nInd}</b></td></tr>`;
   }
@@ -442,7 +464,7 @@ function renderDays(){
   const gmax = Math.max(1, ...depts.map(d => d.maxDense || 0));
   let h = `<div class="card"><div class="row"><h2 style="margin:0">各科獨立天數</h2><span class="spacer"></span>
     <select onchange="S.ui.daysDeptSort=this.value;render()"><option value="median" ${s==="median"?"selected":""}>依中位數（快→慢）</option><option value="count" ${s==="count"?"selected":""}>依可獨立人數</option><option value="total" ${s==="total"?"selected":""}>依案量</option></select></div>
-    <p class="sub" style="margin-top:8px"><b>密集訓練天數</b>：從第一次進該科，到必訓術式全部達 ${M.thr} 次那天為止，這段期間實際有上刀的天數（休假不算）。<b>日曆天</b>：同一段期間的日曆天數（含休假），反映排班密度。</p>
+    <p class="sub" style="margin-top:8px">這頁是系統依手術紀錄計算的參考值，和你們的判定無關。<b>密集訓練天數</b>：從第一次進該科，到必訓術式全部達 ${M.thr} 次那天為止，這段期間實際有上刀的天數（休假不算）。<b>日曆天</b>：同一段期間的日曆天數（含休假），反映排班密度。</p>
     <div class="tw"><table><thead><tr><th>科別</th><th class="num">密集天數中位數</th><th class="num">最快</th><th class="num">最慢</th><th class="num">日曆天中位數</th><th class="num">已獨立人數</th><th>分布（● 每人，｜ 中位數）</th></tr></thead><tbody>`;
   for (const d of depts){
     const dots = d.dense.map(v => `<i style="left:${(v/gmax*100).toFixed(1)}%"></i>`).join("");
@@ -478,12 +500,12 @@ function renderPeople(){
       </select>
       <label style="font-size:12.5px"><input type="checkbox" ${S.ui.showHidden?"checked":""} onchange="S.ui.showHidden=this.checked;render()"> 顯示已隱藏人員</label>
     </div>
-    <div class="tw"><table><thead><tr><th>#</th><th>員編</th><th>姓名</th><th>到職日</th><th>年資</th><th class="num">可獨立</th><th class="num">學習中</th><th class="num">案件</th><th>最近上刀</th><th>操作</th></tr></thead><tbody>`;
+    <div class="tw"><table><thead><tr><th>#</th><th>員編</th><th>姓名</th><th>到職日</th><th>年資</th><th class="num">可獨立</th><th class="num">未判定</th><th class="num">案件</th><th>最近上刀</th><th>操作</th></tr></thead><tbody>`;
   list.forEach((p, i) => {
     const stale = p.last && dayDiff(p.last, maxD) > 180;
     h += `<tr style="${p.hidden?"opacity:.5":""}"><td class="muted">${i+1}</td><td>${esc(p.eid)||'<span class="muted">—</span>'}</td><td><b>${esc(p.name)}</b></td><td>${esc(p.hire)||'<span class="muted">—</span>'}</td>
       <td>${p.tenure?`<span class="pill ${tenureCls(p.tenure.months)}">${p.tenure.label}</span>`:'<span class="muted">—</span>'}</td>
-      <td class="num">${p.nInd?`<span class="pill p-ind">✓ ${p.nInd} 科</span>`:'<span class="muted">0</span>'}</td><td class="num">${p.nLrn}</td><td class="num">${fmtN(p.cases)}</td>
+      <td class="num">${p.nInd?`<span class="pill p-ind">✓ ${p.nInd} 科</span>`:'<span class="muted">0</span>'}</td><td class="num">${p.nPend}</td><td class="num">${fmtN(p.cases)}</td>
       <td>${dStr(p.last)}${stale?' <span class="pill p-gray">半年無紀錄</span>':''}</td>
       <td class="row" style="gap:4px;flex-wrap:nowrap"><button class="sm primary" onclick="openPerson('${esc(jsq(p.name))}')">📊 分析</button><button class="sm" onclick="editStaff('${esc(jsq(p.name))}')">✎</button><button class="sm" onclick="toggleHide('${esc(jsq(p.name))}')">${p.hidden?"顯示":"隱藏"}</button><button class="sm danger" title="刪除" onclick="askRemovePerson('${esc(jsq(p.name))}')">🗑</button></td></tr>`;
   });
@@ -510,7 +532,7 @@ function renderData(){
   }
   h += `</div>`;
   // settings
-  h += `<div class="card"><h2>⚙️ 訓練基準設定</h2><p class="sub">系統依每科專責案件的術式頻率自動分級：累積佔比前 <b>${st.high}%</b> 為「高頻 必訓」、到 <b>${st.mid}%</b> 為「中頻 進階」、其餘為「低頻 選修」。每項必訓術式參與達門檻次數，即視為該科可獨立。各科必訓清單可以手動調整。</p>
+  h += `<div class="card"><h2>⚙️ 訓練基準設定</h2><p class="sub">系統依每科專責案件的術式頻率自動分級：累積佔比前 <b>${st.high}%</b> 為「高頻 必訓」、到 <b>${st.mid}%</b> 為「中頻 進階」、其餘為「低頻 選修」。每項必訓術式參與達門檻次數，系統就會「建議」該科可獨立（最後仍由你們判定）。各科必訓清單可以手動調整。</p>
     <form class="row" onsubmit="event.preventDefault();saveSettings(this)" style="margin-bottom:14px">
       <label>每項術式門檻 <input name="thr" type="number" min="1" max="50" value="${st.thr}" style="width:64px"> 次</label>
       <label>高頻累積 <input name="high" type="number" min="10" max="95" value="${st.high}" style="width:64px"> %</label>
@@ -543,18 +565,18 @@ function renderData(){
 
 /* ---------- modals ---------- */
 function openModal(html){ $("#modal").innerHTML = html; $("#modalBg").classList.add("on"); }
-function closeModal(){ $("#modalBg").classList.remove("on"); }
+function closeModal(){ $("#modalBg").classList.remove("on"); S.ui.modalKind = null; }
 $("#modalBg").addEventListener("click", e => { if (e.target.id === "modalBg") closeModal(); });
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
 
-function openPerson(name, focusDept){
+function openPerson(name, focusDept, keepScroll){
   const M = S.model; const p = M.people.find(x => x.name === name); if (!p) return;
-  const order = { adv: 0, ind: 1, lrn: 2 };
+  const order = { ind: 0, pend: 1, no: 2 };
   const ks = Object.values(p.skills).sort((a,b) => order[a.status]-order[b.status] || b.cases-a.cases);
   let h = `<div class="mh"><h3>📊 ${esc(p.name)}</h3><span class="muted">${p.eid?"員編 "+esc(p.eid)+"・":""}${p.hire?"到職 "+esc(p.hire)+"・":""}${p.tenure?"年資 "+p.tenure.label:""}</span><span class="spacer"></span><button onclick="closeModal()">✕ 關閉</button></div><div class="mb">
     <div class="kpis" style="grid-template-columns:repeat(auto-fit,minmax(130px,1fr))">
-      <div class="kpi"><div class="l">可獨立科別</div><div class="v">${p.nInd}</div><div class="n">其中進階 ${p.nAdv}</div></div>
-      <div class="kpi"><div class="l">學習中科別</div><div class="v">${p.nLrn}</div></div>
+      <div class="kpi"><div class="l">可獨立科別</div><div class="v">${p.nInd}</div><div class="n">不可獨立 ${p.nNo}</div></div>
+      <div class="kpi"><div class="l">未判定科別</div><div class="v">${p.nPend}</div><div class="n">系統建議可獨立 ${p.nSugg}</div></div>
       <div class="kpi"><div class="l">參與案件</div><div class="v">${fmtN(p.cases)}</div></div>
       <div class="kpi"><div class="l">上刀天數</div><div class="v">${fmtN(p.workDays)}</div><div class="n">${dStr(p.first)} ～ ${dStr(p.last)}</div></div>
     </div>`;
@@ -564,28 +586,35 @@ function openPerson(name, focusDept){
     const d = M.deptByName[k.dept];
     const procRow = x => { const c = k.counts[x]||0; const pct = Math.min(1, c/M.thr)*100; return `<div class="proc"><div><div class="nm" title="${esc(x)}">${esc(x)}</div><div class="pb"><i class="${c>=M.thr?"done":""}" style="width:${pct}%"></i></div></div><div class="ct">${c} / ${M.thr}</div></div>`; };
     h += `<div class="dcard" ${focusDept===k.dept?'style="border-color:#7c3aed;box-shadow:0 0 0 2px #ede9fe"':''} id="pc-${esc(encodeURIComponent(k.dept))}"><h4>${esc(k.dept)} ${pill(k.status)}${!d.eligible?'<span class="pill p-gray">未列入盤點</span>':''}</h4>
-      <div class="facts">案件 ${k.cases}・${k.days} 天・必訓進度 ${Math.round(k.progress*100)}%<br>首次 ${dStr(k.first)}${k.reach?`・獨立於 ${dStr(k.reach)}<br>密集訓練 <b>${k.dense}</b> 天・日曆 ${k.cal} 天${d.medDense!==null?`（該科中位數 ${d.medDense} 天）`:""}`:`・最近 ${dStr(k.last)}`}</div>
+      <div class="row" style="margin-bottom:8px;gap:6px">${judgeBtns(p.name, k.dept, k)}${k.jAt?`<span class="muted" style="font-size:11.5px">判定於 ${esc(k.jAt)}</span>`:""}</div>
+      <div style="margin-bottom:6px">${suggPill(k)}</div>
+      <div class="facts">${k.cases ? `案件 ${k.cases}・${k.days} 天・必訓進度 ${Math.round(k.progress*100)}%<br>首次 ${dStr(k.first)}${k.reach?`・達必訓門檻於 ${dStr(k.reach)}<br>密集訓練 <b>${k.dense ?? "—"}</b> 天・日曆 ${k.cal ?? "—"} 天${d.medDense!==null?`（該科中位數 ${d.medDense} 天）`:""}`:`・最近 ${dStr(k.last)}`}` : "目前資料期間內沒有這科的手術紀錄。"}</div>
       <div style="font-size:11.5px;font-weight:600;color:#5b21b6">必訓術式</div>${d.req.map(procRow).join("")||'<div class="muted" style="font-size:12px">此科沒有必訓術式</div>'}
       ${d.mid.length?`<details><summary>中頻 進階術式（${d.mid.filter(x=>(k.counts[x]||0)>=M.thr).length}/${d.mid.length} 達標）</summary>${d.mid.map(procRow).join("")}</details>`:""}
     </div>`;
   }
-  h += `</div></div>`;
-  openModal(h);
-  if (focusDept) setTimeout(() => { const n = document.getElementById("pc-"+encodeURIComponent(focusDept)); if (n) n.scrollIntoView({ block: "center" }); }, 30);
+  h += `</div>`;
+  const others = M.depts.filter(d => d.eligible && !p.skills[d.name]);
+  if (others.length) h += `<details style="margin-top:14px"><summary>其他科別（沒有手術紀錄，也可以直接判定）</summary><div class="tw" style="margin-top:8px"><table><tbody>${others.map(d => `<tr><td>${esc(d.name)}</td><td>${judgeBtns(p.name, d.name, null)}</td></tr>`).join("")}</tbody></table></div></details>`;
+  h += `</div>`;
+  S.ui.openPersonName = p.name; S.ui.openPersonFocus = focusDept || null;
+  openModal(h); S.ui.modalKind = "person";
+  if (focusDept && !keepScroll) setTimeout(() => { const n = document.getElementById("pc-"+encodeURIComponent(focusDept)); if (n) n.scrollIntoView({ block: "center" }); }, 30);
 }
 
 function openDept(name){
   const M = S.model; const d = M.deptByName[name]; if (!d) return;
-  const rows = M.visible.map(p => ({ p, k: p.skills[name] })).filter(x => x.k).sort((a,b) => ({adv:0,ind:1,lrn:2}[a.k.status] - {adv:0,ind:1,lrn:2}[b.k.status]) || b.k.progress - a.k.progress);
-  let h = `<div class="mh"><h3>🏥 ${esc(name)}</h3><span class="muted">${fmtN(d.total)} 例・可獨立 ${d.nInd} 人・學習中 ${d.nLrn} 人</span><span class="spacer"></span><button onclick="closeModal()">✕ 關閉</button></div><div class="mb">
+  S.ui.openDeptName = name;
+  const rows = M.visible.map(p => ({ p, k: p.skills[name] })).filter(x => x.k).sort((a,b) => ({ind:0,pend:1,no:2}[a.k.status] - {ind:0,pend:1,no:2}[b.k.status]) || b.k.progress - a.k.progress);
+  let h = `<div class="mh"><h3>🏥 ${esc(name)}</h3><span class="muted">${fmtN(d.total)} 例・可獨立 ${d.nInd} 人・不可獨立 ${d.nNo} 人・未判定 ${d.nPend} 人</span><span class="spacer"></span><button onclick="closeModal()">✕ 關閉</button></div><div class="mb">
     <p class="sub"><b>必訓術式</b>（各需 ${M.thr} 次）：${d.req.map(esc).join("、")}</p>
-    <div class="tw"><table><thead><tr><th>姓名</th><th>狀態</th><th class="num">案件</th><th>必訓進度</th><th class="num">密集天數</th><th class="num">日曆天</th><th>首次</th><th>最近</th></tr></thead><tbody>`;
-  for (const { p, k } of rows) h += `<tr><td><a class="lnk" onclick="openPerson('${esc(jsq(p.name))}','${esc(jsq(name))}')">${esc(p.name)}</a></td><td>${pill(k.status)}</td><td class="num">${k.cases}</td><td><div class="row" style="gap:6px;flex-wrap:nowrap"><div class="bar" style="min-width:70px;width:70px"><i style="width:${(k.progress*100).toFixed(0)}%;background:${k.status==="lrn"?"var(--lrn)":"var(--ind)"}"></i></div>${Math.round(k.progress*100)}%</div></td><td class="num">${k.dense ?? "—"}</td><td class="num">${k.cal ?? "—"}</td><td>${dStr(k.first)}</td><td>${dStr(k.last)}</td></tr>`;
+    <div class="tw"><table><thead><tr><th>姓名</th><th>判定</th><th>系統建議</th><th class="num">案件</th><th>必訓進度</th><th class="num">密集天數</th><th class="num">日曆天</th><th>首次</th><th>最近</th></tr></thead><tbody>`;
+  for (const { p, k } of rows) h += `<tr><td><a class="lnk" onclick="openPerson('${esc(jsq(p.name))}','${esc(jsq(name))}')">${esc(p.name)}</a></td><td>${judgeBtns(p.name, name, k)}</td><td>${suggPill(k)}</td><td class="num">${k.cases}</td><td><div class="row" style="gap:6px;flex-wrap:nowrap"><div class="bar" style="min-width:70px;width:70px"><i style="width:${(k.progress*100).toFixed(0)}%;background:${k.auto==="ok"?"var(--ind)":"var(--lrn)"}"></i></div>${Math.round(k.progress*100)}%</div></td><td class="num">${k.dense ?? "—"}</td><td class="num">${k.cal ?? "—"}</td><td>${dStr(k.first)}</td><td>${dStr(k.last)}</td></tr>`;
   h += `</tbody></table></div>
     <h3 style="font-size:13.5px;margin:16px 0 6px">術式頻率</h3><div class="tw"><table><thead><tr><th>術式</th><th>分級</th><th class="num">例數</th><th class="num">佔比</th></tr></thead><tbody>`;
   for (const pr of d.procs.slice(0, 40)) h += `<tr><td>${esc(pr.name)}</td><td>${tierPill(pr.tier)}${d.req.includes(pr.name)?' <span class="pill p-H">必訓</span>':''}</td><td class="num">${pr.count}</td><td class="num">${(pr.share*100).toFixed(1)}%</td></tr>`;
   h += `</tbody></table></div>${d.procs.length>40?`<p class="sub">只列出前 40 項（共 ${d.procs.length} 項）。</p>`:""}</div>`;
-  openModal(h);
+  openModal(h); S.ui.modalKind = "dept";
 }
 
 /* ---------- import ---------- */
@@ -606,14 +635,21 @@ async function readTable(file){
     const tsv = /\.tsv$/i.test(file.name) || (text.split("\n")[0].split("\t").length > text.split("\n")[0].split(",").length);
     wb = XLSX.read(text, { type: "string", FS: tsv ? "\t" : ",", raw: true });
   } else wb = XLSX.read(buf, { type: "array" });
+  let best = null;
   for (const sn of wb.SheetNames){
     const aoa = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, defval: "", raw: true });
     for (let i = 0; i < Math.min(15, aoa.length); i++){
       const hdr = aoa[i].map(x => String(x).replace(/\s/g, ""));
       const col = findCols(hdr);
-      if (col.dept >= 0 && col.np >= 0) return { sheet: sn, hdr, col, body: aoa.slice(i+1) };
+      if (col.dept >= 0 && col.np >= 0){
+        const body = aoa.slice(i+1);
+        const n = body.filter(r => String(r[col.dept] ?? "").trim()).length;
+        if (!best || n > best.n) best = { sheet: sn, hdr, col, body, n, sheets: wb.SheetNames.length };
+        break;
+      }
     }
   }
+  if (best) return best;
   throw new Error("找不到「科別名稱」與「專責護理師」欄位。請確認第一列是欄位名稱。");
 }
 function findCols(h){
@@ -628,13 +664,15 @@ function findCols(h){
 async function parseFile(file, extraOverlap){
   const t = await readTable(file);
   if (t.col.proc < 0) throw new Error("找不到「主手術名稱」欄位。");
-  const rows = []; let badDate = 0, noNp = 0, total = 0;
+  const rows = []; let badDate = 0, noNp = 0, total = 0, cases = 0; const eids = {};
   for (const r of t.body){
     const dept = String(r[t.col.dept] ?? "").trim(); const proc = String(r[t.col.proc] ?? "").trim();
     if (!dept && !proc) continue;
     total++;
-    const names = splitNames(r[t.col.np]); if (!names.length){ noNp++; continue; }
+    const ppl = splitPeople(r[t.col.np]); if (!ppl.length){ noNp++; continue; }
+    const names = ppl.map(x => x.name); for (const x of ppl) if (x.eid && !eids[x.name]) eids[x.name] = x.eid;
     let d = 0; if (t.col.date >= 0){ d = parseDate(r[t.col.date]); if (!d){ badDate++; continue; } }
+    cases++;
     for (const n of names) rows.push({ d, dept: dept || "（未填科別）", proc: proc || "（未填術式）", np: n });
   }
   if (!rows.length) throw new Error(`讀到 ${total} 筆手術，但沒有任何一筆有專責護理師${t.col.date>=0?"與可辨識的日期":""}。`);
@@ -642,7 +680,7 @@ async function parseFile(file, extraOverlap){
   if (!maxD){ minD = 0; maxD = 0; }
   const others = S.imports.concat(S.memImports, extraOverlap);
   const overlap = maxD ? others.filter(im => im.maxD && !(im.maxD < minD || im.minD > maxD)) : [];
-  return { file: file.name, rows, total, noNp, badDate, minD, maxD, overlap, cols: t.col, hdr: t.hdr, names: new Set(rows.map(r=>r.np)).size, depts: new Set(rows.map(r=>r.dept)).size };
+  return { file: file.name, sheet: t.sheet, sheets: t.sheets, eids, cases, rows, total, noNp, badDate, minD, maxD, overlap, cols: t.col, hdr: t.hdr, names: new Set(rows.map(r=>r.np)).size, depts: new Set(rows.map(r=>r.dept)).size };
 }
 async function handleFiles(fileList){
   const files = [...(fileList || [])]; if (!files.length) return;
@@ -668,8 +706,8 @@ function renderPending(){
   for (const P of L){
     if (P.error){ h += `<div style="margin-top:10px;padding-top:10px;border-top:1px dashed #fcd34d;color:#b91c1c"><b>❌ ${esc(P.file)}</b>：${esc(P.error)}（這個檔案不會匯入）</div>`; continue; }
     const c = P.cols, H = P.hdr;
-    h += `<div style="margin-top:10px;padding-top:10px;border-top:1px dashed #fcd34d;color:#334155"><b>📄 ${esc(P.file)}</b>　${P.maxD?`${dStr(P.minD)} ～ ${dStr(P.maxD)}`:"（無日期）"}　<b>${fmtN(P.rows.length)}</b> 筆專責紀錄（${P.names} 人、${P.depts} 科，全檔 ${fmtN(P.total)} 筆手術）
-      <br><span class="muted" style="font-size:12px">欄位：日期「${c.date>=0?esc(H[c.date]):"（無）"}」・科別「${esc(H[c.dept])}」・術式「${esc(H[c.proc])}」・專責「${esc(H[c.np])}」${P.noNp?`・${fmtN(P.noNp)} 筆沒有專責已略過`:""}</span>
+    h += `<div style="margin-top:10px;padding-top:10px;border-top:1px dashed #fcd34d;color:#334155"><b>📄 ${esc(P.file)}</b>　${P.maxD?`${dStr(P.minD)} ～ ${dStr(P.maxD)}`:"（無日期）"}　全檔 ${fmtN(P.total)} 台手術，其中 <b>${fmtN(P.cases)}</b> 台有專責參與（${P.names} 人、${P.depts} 科；一台多位專責分別計算，共 ${fmtN(P.rows.length)} 人次）
+      <br><span class="muted" style="font-size:12px">${P.sheets>1?`讀取工作表「${esc(P.sheet)}」（資料最多的那一張）・`:""}${Object.keys(P.eids).length?`自動帶入 ${Object.keys(P.eids).length} 人的員編・`:""}欄位：日期「${c.date>=0?esc(H[c.date]):"（無）"}」・科別「${esc(H[c.dept])}」・術式「${esc(H[c.proc])}」・專責「${esc(H[c.np])}」${P.noNp?`・${fmtN(P.noNp)} 筆沒有專責已略過`:""}</span>
       ${P.badDate?`<br>⚠️ ${fmtN(P.badDate)} 筆日期無法辨識，已略過。`:""}
       ${P.overlap.length?`<br>⚠️ 和「${P.overlap.map(o=>esc(o.file)).join("」、「")}」的日期重疊，同一台刀可能被算兩次。`:""}</div>`;
   }
@@ -681,9 +719,21 @@ async function commitPending(){
   renderPending();
   let n = 0;
   for (const P of L){ toast(`匯入中… ${P.file}`, 20000); if (await commitOne(P)) n += P.rows.length; }
+  await applyEids(L);
   if (S.dbState === "local" && S.localOk) await saveLocal();
   render();
   if (n) toast(`✅ 已匯入 ${L.length} 個檔案，共 ${fmtN(n)} 筆專責紀錄`, 4000);
+}
+async function applyEids(L){
+  const all = {}; for (const P of L) Object.assign(all, P.eids || {});
+  const have = staffByName();
+  for (const name in all){
+    const ex = have[name]; if (ex && ex.eid) continue;
+    const id = ex?._id || ("s" + Date.now().toString(36) + Math.random().toString(36).slice(2,6));
+    const body = { name, eid: all[name], hire: ex?.hire || "", hidden: ex?.hidden || false };
+    S.staff[id] = body;
+    if (S.db && S.dbState === "ok" && !S.demo && S.canWrite){ try { await dbRetry(() => S.db.doc(`staff/${id}`).set(body)); } catch (e) {} }
+  }
 }
 async function commitOne(P){
   const id = "i" + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
@@ -793,6 +843,64 @@ async function removePerson(name){
   await writeSettings({ ...S.settings, removed });
 }
 async function restorePerson(name){ await writeSettings({ ...S.settings, removed: (S.settings.removed || []).filter(n => n !== name) }); }
+let judgeWriting = Promise.resolve();
+async function setJudge(name, dept, val){
+  const prev = JSON.parse(JSON.stringify(S.judg));
+  const m = { ...(S.judg[name] || {}) };
+  if (val) m[dept] = { s: val, at: dStr(todayInt()) }; else delete m[dept];
+  S.judg = { ...S.judg, [name]: m }; if (!Object.keys(m).length) delete S.judg[name];
+  rerenderKeepModal();
+  await persistJudg(prev);
+}
+async function persistJudg(prev){
+  if (S.demo) return;
+  if (S.dbState === "local"){ await saveLocal(); return; }
+  if (!S.db || S.dbState === "off") return;
+  const snapshot = S.judg;
+  judgeWriting = judgeWriting.then(async () => {
+    try { await dbRetry(() => S.db.doc("config/judgments").set({ j: snapshot })); }
+    catch (e) { S.judg = prev; render(); handleWriteErr(e); }
+  });
+  await judgeWriting;
+}
+function rerenderKeepModal(){
+  const open = $("#modalBg").classList.contains("on");
+  const sc = $("#modalBg").scrollTop;
+  const which = S.ui.modalKind;
+  render();
+  if (!open) return;
+  if (which === "person") openPerson(S.ui.openPersonName, S.ui.openPersonFocus, true);
+  else if (which === "dept") openDept(S.ui.openDeptName);
+  else if (which === "judge") closeModal();
+  $("#modalBg").scrollTop = sc;
+}
+function openJudge(name, dept){
+  const M = S.model; const p = M.people.find(x => x.name === name); const d = M.deptByName[dept]; if (!p || !d) return;
+  const k = p.skills[dept];
+  const procRow = x => { const c = k?.counts[x]||0; const pct = Math.min(1, c/M.thr)*100; return `<div class="proc"><div><div class="nm" title="${esc(x)}">${esc(x)}</div><div class="pb"><i class="${c>=M.thr?"done":""}" style="width:${pct}%"></i></div></div><div class="ct">${c} / ${M.thr}</div></div>`; };
+  openModal(`<div class="mh"><h3>${esc(name)}・${esc(dept)}</h3>${k?pill(k.status):pill("pend")}<span class="spacer"></span><button onclick="closeModal()">✕</button></div><div class="mb">
+    <div class="row" style="margin-bottom:12px">${judgeBtns(name, dept, k)}${k?.jAt?`<span class="muted" style="font-size:12px">判定於 ${esc(k.jAt)}</span>`:""}<span class="spacer"></span><a class="lnk" onclick="openPerson('${esc(jsq(name))}','${esc(jsq(dept))}')">看這個人全部科別 →</a></div>
+    <div style="margin-bottom:8px">${k ? suggPill(k) : '<span class="pill p-gray">無手術紀錄</span>'}</div>
+    <div class="facts" style="font-size:12.5px;color:var(--ink2);margin-bottom:8px">${k && k.cases ? `案件 ${k.cases}・${k.days} 天・首次 ${dStr(k.first)}・最近 ${dStr(k.last)}` : "目前資料期間內沒有這科的手術紀錄。"}</div>
+    <div style="font-size:11.5px;font-weight:600;color:#5b21b6">必訓術式（參考）</div>${d.req.map(procRow).join("")}
+    ${d.mid.length?`<details><summary>中頻術式（${d.mid.length} 項）</summary>${d.mid.map(procRow).join("")}</details>`:""}</div>`);
+  S.ui.modalKind = "judge";
+}
+function askApplySugg(){
+  const M = S.model; const list = [];
+  for (const p of M.visible) for (const k of Object.values(p.skills)) if (k.status === "pend" && k.auto === "ok" && M.deptByName[k.dept].eligible) list.push([p.name, k.dept]);
+  openModal(`<div class="mh"><h3>套用系統建議</h3><span class="spacer"></span><button onclick="closeModal()">✕</button></div><div class="mb">
+    <p>要把下面 <b>${list.length}</b> 項「系統建議可獨立、但還沒判定」的全部設為 <b>可獨立</b> 嗎？已經判定過的不會被改。之後還是可以一項一項改回來。</p>
+    <div class="reqlist" style="max-height:260px">${list.map(([n,d]) => `<div style="font-size:12.5px;padding:3px 0">${esc(n)}・${esc(d)}</div>`).join("")}</div>
+    <div class="row" style="margin-top:12px"><button class="primary" onclick="applySugg()">全部設為可獨立</button><button onclick="closeModal()">取消</button></div></div>`);
+  S.ui.modalKind = "apply";
+}
+async function applySugg(){
+  closeModal();
+  const M = S.model; const prev = JSON.parse(JSON.stringify(S.judg)); const J = JSON.parse(JSON.stringify(S.judg)); let n = 0;
+  for (const p of M.visible) for (const k of Object.values(p.skills)) if (k.status === "pend" && k.auto === "ok" && M.deptByName[k.dept].eligible){ (J[p.name] ||= {})[k.dept] = { s: "ind", at: dStr(todayInt()) }; n++; }
+  S.judg = J; render(); await persistJudg(prev); toast(`✅ 已將 ${n} 項設為可獨立`);
+}
 function toggleHide(name){ const p = S.model.people.find(x => x.name === name); putStaff({ name, hidden: !p.hidden }); }
 
 /* ---------- export ---------- */
@@ -800,8 +908,8 @@ async function exportMatrix(){
   const M = S.model; const depts = M.depts.filter(d => d.eligible);
   const ppl = sortedPeople(M.visible.filter(p => p.cases > 0 || p.manual), S.ui.matrixSort);
   const q = v => { v = String(v ?? ""); return /[",\n]/.test(v) ? `"${v.replace(/"/g,'""')}"` : v; };
-  const lines = [["員編","姓名","到職日","可獨立科數","學習中科數", ...depts.map(d => d.name)].map(q).join(",")];
-  for (const p of ppl) lines.push([p.eid, p.name, p.hire, p.nInd, p.nLrn, ...depts.map(d => { const k = p.skills[d.name]; return !k ? "" : k.status === "lrn" ? `學習中 ${Math.round(k.progress*100)}%` : `${STATUS[k.status][0]}（${k.dense}天）`; })].map(q).join(","));
+  const lines = [["員編","姓名","到職日","可獨立科數","不可獨立科數","未判定科數", ...depts.map(d => d.name)].map(q).join(",")];
+  for (const p of ppl) lines.push([p.eid, p.name, p.hire, p.nInd, p.nNo, p.nPend, ...depts.map(d => { const k = p.skills[d.name]; return !k ? "" : k.status === "pend" ? `未判定（系統${k.auto==="ok"?"建議可獨立":"：學習中 "+Math.round(k.progress*100)+"%"}）` : STATUS[k.status][0]; })].map(q).join(","));
   const csv = String.fromCharCode(0xFEFF) + lines.join("\r\n");
   const fname = `專責技能盤點_${dStr(todayInt())}.csv`;
   try {
@@ -854,11 +962,12 @@ function loadDemo(){
   S._realStaff = S.staff; S.staff = {};
   people.forEach(([name, hire], i) => S.staff["demo" + i] = { name, hire, eid: String(17000 + i*37), hidden: false });
   S._realSettings = S.settings; S.settings = { ...DEFAULTS };
+  S._realJudg = S.judg; S.judg = {};
   S.demo = true; go("overview");
 }
 function exitDemo(silent){
   S.demo = false; S.memChunks = {}; S.memImports = [];
-  if (S._realStaff) S.staff = S._realStaff; if (S._realSettings) S.settings = S._realSettings;
+  if (S._realStaff) S.staff = S._realStaff; if (S._realSettings) S.settings = S._realSettings; if (S._realJudg) S.judg = S._realJudg;
   if (S.dbState === "local"){ loadLocal().then(() => { if (!silent) render(); }); return; }
   if (!silent) render();
 }
@@ -884,7 +993,7 @@ async function initDb(){
   if (!db){ goLocal(); return; }
   S.db = db;
   try { const user = await claude.use("user"); if (user && user.can){ const w = await user.can("data.write"); if (w === false) S.canWrite = false; } } catch (e) {}
-  let pending = 4; const got = new Set();
+  let pending = 5; const got = new Set();
   const timer = setTimeout(() => { if (S.dbState === "connecting"){ S.dbState = "slow"; render(); } }, 10000);
   const done = (key, snap) => {
     if (snap && snap.metadata && !snap.metadata.fromCache && !got.has(key)){ got.add(key); pending--; }
@@ -895,6 +1004,7 @@ async function initDb(){
   db.collection("imports").onSnapshot(snap => { S.imports = snap.docs.filter(d => d.exists).map(d => ({ id: d.id, ...d.data() })); done("imports", snap); }, fail);
   db.collection("records").onSnapshot(snap => { const c = {}; for (const d of snap.docs) if (d.exists) c[d.id] = d.data(); S.chunks = c; done("records", snap); }, fail);
   db.collection("staff").onSnapshot(snap => { const st = {}; for (const d of snap.docs) if (d.exists) st[d.id] = d.data(); if (S.demo) S._realStaff = st; else S.staff = st; done("staff", snap); }, fail);
+  db.doc("config/judgments").onSnapshot(snap => { const v = snap.exists ? (snap.data().j || {}) : {}; if (S.demo) S._realJudg = v; else S.judg = v; done("judg", snap); }, fail);
   db.doc("config/settings").onSnapshot(snap => { const v = snap.exists ? { ...DEFAULTS, ...snap.data() } : { ...DEFAULTS }; if (S.demo) S._realSettings = v; else S.settings = v; done("config", snap); }, fail);
 }
 
@@ -911,13 +1021,13 @@ async function idbSet(key, val){ const db = await idb(); return new Promise((res
 async function loadLocal(){
   try {
     const v = await idbGet("state");
-    S.memImports = v?.imports || []; S.memChunks = v?.chunks || {}; S.staff = v?.staff || {}; S.settings = { ...DEFAULTS, ...(v?.settings || {}) };
+    S.memImports = v?.imports || []; S.memChunks = v?.chunks || {}; S.staff = v?.staff || {}; S.settings = { ...DEFAULTS, ...(v?.settings || {}) }; S.judg = v?.judg || {};
     S.localOk = true;
   } catch (e) { S.localOk = false; }
 }
 async function saveLocal(){
   if (S.dbState !== "local" || S.demo || !S.localOk) return;
-  try { await idbSet("state", { imports: S.memImports, chunks: S.memChunks, staff: S.staff, settings: S.settings }); }
+  try { await idbSet("state", { imports: S.memImports, chunks: S.memChunks, staff: S.staff, settings: S.settings, judg: S.judg }); }
   catch (e) { toast("❌ 無法存到瀏覽器：" + (e && e.message || e), 6000); }
 }
 async function goLocal(){ S.dbState = "local"; S.db = null; await loadLocal(); render(); }
